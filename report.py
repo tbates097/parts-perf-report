@@ -4,6 +4,8 @@ import csv
 import json
 import os
 import re
+import importlib.util
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
@@ -310,8 +312,16 @@ def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], O
     if not isinstance(mech, dict):
         return None, None, None, False
 
-    def collect(filter_fn) -> List[Tuple[float, str, str, bool]]:
-        out: List[Tuple[float, str, str, bool]] = []
+    def collect(filter_fn) -> List[Tuple[float, str, str, bool, Optional[float]]]:
+        out: List[Tuple[float, str, str, bool, Optional[float]]] = []
+        def to_um_local(val: float, u: Optional[str]) -> Optional[float]:
+            if u in (None, "", "um"):
+                return val
+            if u == "nm":
+                return val / 1000.0
+            if u == "mm":
+                return val * 1000.0
+            return None
         for k, v in mech.items():
             if not isinstance(v, str):
                 continue
@@ -321,10 +331,11 @@ def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], O
             num, unit, has_pm = parse_numeric_with_unit(v)
             if num is None:
                 continue
-            out.append((num, (unit or ""), k, has_pm))
+            norm = to_um_local(num, unit or None)
+            out.append((num, (unit or ""), k, has_pm, norm))
         return out
 
-    candidates: List[Tuple[float, str, str, bool]] = []
+    candidates: List[Tuple[float, str, str, bool, Optional[float]]] = []
     if want == "repeatability":
         # Prefer keys that include both "repeatability" and "bidirectional" (keywords, not exact match)
         candidates = collect(lambda kl: ("repeatability" in kl and "bidirectional" in kl))
@@ -332,14 +343,11 @@ def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], O
             # Fallback to any repeatability if bidirectional form not found
             candidates = collect(lambda kl: ("repeatability" in kl))
     elif want == "accuracy_standard":
-        # Prefer non-calibrated accuracy that explicitly mentions Standard/Uncalibrated/Base
-        candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl and ("standard" in kl or "uncalibrated" in kl or re.search(r"\\bbase\\b", kl))))
-        if not candidates:
-            # Fallback to any non-calibrated accuracy entry
-            candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl))
+        # Non-calibrated accuracy must explicitly indicate Standard/Uncalibrated/Base; do NOT use generic accuracy here
+        candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl and ("standard" in kl or "uncalibrated" in kl or "base" in kl) and ("plus" not in kl)))
     elif want == "accuracy_calibrated":
         # Accuracy that explicitly mentions Calibrated/Plus
-        candidates = collect(lambda kl: ("accuracy" in kl and ("calibrated" in kl or re.search(r"\\bplus\\b", kl))))
+        candidates = collect(lambda kl: ("accuracy" in kl and ("calibrated" in kl or "plus" in kl)))
         if not candidates:
             # If there is no explicit Calibrated/Plus accuracy, assume provided accuracy is calibrated
             candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl))
@@ -350,7 +358,8 @@ def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], O
         return None, None, None, False
 
     # Choose the candidate with the maximum numeric tolerance (most permissive bound)
-    num, unit, key, has_pm = max(candidates, key=lambda t: t[0])
+    # Prefer the candidate with the largest normalized µm value; fallback to raw value if normalization missing
+    num, unit, key, has_pm, norm = max(candidates, key=lambda t: (t[4] if t[4] is not None else t[0]))
     return num, (unit or None), key, has_pm
 
 
@@ -438,8 +447,8 @@ def process_product_specs_mode(results_raw: Any, specs_raw: Any, allow_ctrl_stri
                 if u == "mm":
                     return val * 1000.0
                 return None  # unsupported units for this metric
-            # If spec is "+/- X", convert to peak-to-peak for repeatability by doubling
-            if want == "repeatability" and has_pm and limit is not None:
+            # If spec is "+/- X", convert to peak-to-peak by doubling for repeatability and accuracy
+            if has_pm and limit is not None and want in ("repeatability", "accuracy_standard", "accuracy_calibrated"):
                 limit = limit * 2.0
             limit_um = to_um(limit, unit)
             if limit_um is None:
@@ -505,12 +514,33 @@ def write_csv(rows: Iterable[Dict[str, Any]], out_path: str) -> None:
             writer.writerow(row)
 
 
+def _run_summary(report_path: str, out_csv: Optional[str], out_html: Optional[str]) -> None:
+    try:
+        base_dir = Path(__file__).parent
+        mod_path = base_dir / "scripts" / "build_summary_ui.py"
+        spec = importlib.util.spec_from_file_location("build_summary_ui", str(mod_path))
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        rows = module.read_rows(Path(report_path))
+        items = module.build_summary(rows)
+        module.write_summary_csv(items, Path(out_csv or Path(report_path).with_name("summary.csv")))
+        module.write_summary_html(items, Path(out_html or Path(report_path).with_name("summary.html")))
+    except Exception:
+        # Best-effort; do not raise if summary generation fails
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Report performance vs specs.")
     parser.add_argument("--tests", required=True, help="Path to JSON with test results (Results.json or sample)")
     parser.add_argument("--specs", required=True, help="Path to JSON with specs (Product Specs.json or sample)")
     parser.add_argument("--out", default="report.csv", help="Output CSV path")
     parser.add_argument("--allow-ctrl-strip", action="store_true", help="Allow stripping trailing -ACS/-ASR when mapping part numbers")
+    parser.add_argument("--summary", action="store_true", help="Also generate summary.csv and summary.html for fully matched PNs")
+    parser.add_argument("--summary-csv", default=None, help="Optional path for summary CSV output")
+    parser.add_argument("--summary-html", default=None, help="Optional path for summary HTML output")
     args = parser.parse_args()
 
     tests_raw = load_json(args.tests)
@@ -519,6 +549,8 @@ def main() -> None:
     if looks_like_product_specs(specs_raw):
         rows = list(process_product_specs_mode(tests_raw, specs_raw, allow_ctrl_strip=args.allow_ctrl_strip))
         write_csv(rows, args.out)
+        if args.summary:
+            _run_summary(args.out, args.summary_csv, args.summary_html)
         return
 
     # Fallback to original simple flow (sample files)
@@ -526,6 +558,8 @@ def main() -> None:
     specs = normalize_specs(specs_raw)
     rows = list(generate_rows(tests, specs))
     write_csv(rows, args.out)
+    if args.summary:
+        _run_summary(args.out, args.summary_csv, args.summary_html)
 
 
 if __name__ == "__main__":
