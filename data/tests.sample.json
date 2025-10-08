@@ -1,0 +1,28 @@
+[
+  {
+    "unit_id": "U001",
+    "part_number": "PN1001",
+    "results": {
+      "frequency_MHz": 1005,
+      "voltage_V": 1.21,
+      "leakage_mA": 9.2
+    }
+  },
+  {
+    "unit_id": "U002",
+    "part_number": "PN1001",
+    "results": {
+      "frequency_MHz": 930,
+      "voltage_V": 1.33,
+      "leakage_mA": 12.0
+    }
+  },
+  {
+    "unit_id": "U101",
+    "part_number": "PN2002",
+    "results": {
+      "frequency_MHz": 1225,
+      "voltage_V": 1.05
+    }
+  }
+]
