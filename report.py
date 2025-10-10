@@ -304,7 +304,7 @@ def parse_numeric_with_unit(s: str) -> Tuple[Optional[float], Optional[str], boo
     return max(nums), unit, has_pm
 
 
-def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], Optional[str], Optional[str], bool]:
+def best_mech_limit(mech: Dict[str, Any], want: str, allow_generic_for_standard: bool = False) -> Tuple[Optional[float], Optional[str], Optional[str], bool]:
     """Search mechanical specs for best numeric limit for a wanted class, using explicit keyword rules.
     want in {"repeatability", "accuracy_standard", "accuracy_calibrated"}
     Returns (limit_value, unit, matched_key)
@@ -345,6 +345,9 @@ def best_mech_limit(mech: Dict[str, Any], want: str) -> Tuple[Optional[float], O
     elif want == "accuracy_standard":
         # Non-calibrated accuracy must explicitly indicate Standard/Uncalibrated/Base; do NOT use generic accuracy here
         candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl and ("standard" in kl or "uncalibrated" in kl or "base" in kl) and ("plus" not in kl)))
+        if not candidates and allow_generic_for_standard:
+            # For families like PlanarDL with PL1, allow generic 'Accuracy' (non-calibrated) when explicitly using PL1
+            candidates = collect(lambda kl: ("accuracy" in kl and "calibrated" not in kl and ("plus" not in kl)))
     elif want == "accuracy_calibrated":
         # Accuracy that explicitly mentions Calibrated/Plus
         candidates = collect(lambda kl: ("accuracy" in kl and ("calibrated" in kl or "plus" in kl)))
@@ -369,6 +372,14 @@ def process_product_specs_mode(results_raw: Any, specs_raw: Any, allow_ctrl_stri
 
     if not isinstance(results_raw, list):
         raise ValueError("Results JSON must be a list of objects with BasePartNum and averages")
+
+    def get_mech_for_key(key_norm: Optional[str]):
+        if key_norm is None:
+            return None, None
+        payload = spec_index.get(key_norm) or {}
+        specs_obj = payload.get("specifications") if isinstance(payload, dict) else None
+        mech_local = specs_obj.get("mechanical") if isinstance(specs_obj, dict) else None
+        return mech_local, key_norm
 
     for rec in results_raw:
         if not isinstance(rec, dict):
@@ -395,23 +406,45 @@ def process_product_specs_mode(results_raw: Any, specs_raw: Any, allow_ctrl_stri
         mech = None
         matched_spec_pn_display = None
         if matched_key is not None:
-            payload = spec_index.get(matched_key) or {}
-            matched_spec_pn_display = None
-            # We don't have the original PN string preserved here; matched_key is canonical (upper, no zero pad)
-            # For display, use the canonical as part_number (user can map back if needed)
-            matched_spec_pn_display = matched_key
-            specs_obj = payload.get("specifications") if isinstance(payload, dict) else None
-            mech = specs_obj.get("mechanical") if isinstance(specs_obj, dict) else None
+            mech, matched_spec_pn_display = get_mech_for_key(matched_key)
+        
+        # Helper: try PL1/PL2 variants when we only have a base match or mech is None
+        pn_norm = CANON_UP(normalize_zeropad(str(base_pn)))
+        def mech_with_pl(want: str):
+            # Prefer PL1 for uncalibrated, PL2 for calibrated, for repeatability try PL2 then PL1
+            choices = []
+            if want == "accuracy_standard":
+                choices = [pn_norm + "-PL1"]
+            elif want == "accuracy_calibrated":
+                # Consider PL2/PL3/PL4 as calibrated performance levels
+                choices = [pn_norm + "-PL2", pn_norm + "-PL3", pn_norm + "-PL4"]
+            else:
+                # Repeatability: try calibrated variants first, then base
+                choices = [pn_norm + "-PL2", pn_norm + "-PL3", pn_norm + "-PL4", pn_norm + "-PL1"]
+            for key in choices:
+                m, disp = get_mech_for_key(key)
+                if m is not None:
+                    return m, disp
+            return None, None
 
         def emit(metric: str, value: Optional[float], want: str):
             if value is None:
                 return
             # Results are assumed to be in microns (um)
             value_um = value
-            if mech is None:
+
+            local_mech = mech
+            local_pn_disp = matched_spec_pn_display or (pn_norm)
+            if local_mech is None and (mtype == "base-only" or matched_key is None):
+                alt_mech, alt_disp = mech_with_pl(want)
+                if alt_mech is not None:
+                    local_mech = alt_mech
+                    local_pn_disp = alt_disp or local_pn_disp
+
+            if local_mech is None:
                 note = "No specific PN in specs" if mtype == "base-only" else reason or "No specs"
                 yield {
-                    "part_number": matched_spec_pn_display or str(base_pn),
+                    "part_number": local_pn_disp,
                     "unit_id": None,
                     "metric": metric,
                     "value": value_um,
@@ -423,7 +456,13 @@ def process_product_specs_mode(results_raw: Any, specs_raw: Any, allow_ctrl_stri
                     "note": note,
                 }
                 return
-            limit, unit, key, has_pm = best_mech_limit(mech, want)
+            # If we derived PL1 explicitly for uncalibrated accuracy, allow generic accuracy keys
+            allow_generic = False
+            if want == "accuracy_standard":
+                disp_upper = (local_pn_disp or "").upper()
+                if disp_upper.endswith("-PL1"):
+                    allow_generic = True
+            limit, unit, key, has_pm = best_mech_limit(local_mech, want, allow_generic_for_standard=allow_generic)
             if limit is None:
                 yield {
                     "part_number": matched_spec_pn_display or str(base_pn),
